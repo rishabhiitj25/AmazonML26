@@ -5,6 +5,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 from rapidfuzz import distance, fuzz
 from rapidfuzz.process import cpdist
 
@@ -94,13 +96,39 @@ def build(cache: Path, split: str, cands: Path, out: Path, gt_path: Path | None,
     F = pd.read_parquet(cands)
     ri, si = F.ri.values, F.si.values
     print(f"[{split}] {len(F):,} pairs; tables loaded {time.time() - t:.0f}s", flush=True)
+    true_si = labels(recs, s1, gt_path) if gt_path is not None else None
+    # One country at a time: every context group (per record / per S1) lies inside one country,
+    # so this is exact and bounds peak memory by the largest country.
+    cty = s1.country.values[si]
+    start = np.flatnonzero(np.r_[True, cty[1:] != cty[:-1]])
+    segments = list(zip(start, np.r_[start[1:], len(F)]))
+    if len({cty[a] for a, _ in segments}) != len(segments):
+        raise ValueError("candidate pairs are not grouped by country")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_suffix(".tmp.parquet")
+    writer = None
+    for a, b in segments:
+        part = pair_features(F.iloc[a:b].reset_index(drop=True), s1, recs, workers)
+        if true_si is not None:
+            part["y"] = (true_si[part.ri.values] == part.si.values).astype(np.int8)
+        tbl = pa.Table.from_pandas(part, preserve_index=False)
+        writer = writer or pq.ParquetWriter(tmp, tbl.schema)
+        writer.write_table(tbl)
+        print(f"  [{split}] {cty[a]}: {b - a:,} pairs done {time.time() - t:.0f}s", flush=True)
+        del part, tbl
+    writer.close()
+    tmp.rename(out)
+    print(f"[{split}] features written in {time.time() - t:.0f}s", flush=True)
+
+
+def pair_features(F: pd.DataFrame, s1: pd.DataFrame, recs: pd.DataFrame, workers: int) -> pd.DataFrame:
+    ri, si = F.ri.values, F.si.values
     for fname, (col, scorer) in STR_FEATS.items():
         a, b = recs[col].values[ri], s1[col].values[si]
         v = cpdist(a, b, scorer=scorer, workers=workers, dtype=np.float32)
         if col in ("addr", "addr_digits"):
             v[(recs[col].values == "")[ri] | (s1[col].values == "")[si]] = np.nan
         F[fname] = v
-        print(f"  {fname} {time.time() - t:.0f}s", flush=True)
     fd_r, fd_s = recs.first_digit.values[ri], s1.first_digit.values[si]
     F["d_first_eq"] = np.where((fd_r == "") | (fd_s == ""), np.nan, (fd_r == fd_s)).astype(np.float32)
     F["r_ntok"] = recs.n_tok.values[ri].astype(np.int16)
@@ -111,13 +139,7 @@ def build(cache: Path, split: str, cands: Path, out: Path, gt_path: Path | None,
     F["r_src3"] = recs.src3.values[ri]
     F["s_twins"] = s1.twins.values[si]
     F["name_eq"] = (recs.name.values[ri] == s1.name.values[si]).astype(np.int8)
-    F = add_context(F)
-    if gt_path is not None:
-        true_si = labels(recs, s1, gt_path)
-        F["y"] = (true_si[ri] == si).astype(np.int8)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    F.to_parquet(out, index=False)
-    print(f"[{split}] features {F.shape} written in {time.time() - t:.0f}s", flush=True)
+    return add_context(F)
 
 
 def main():

@@ -3,6 +3,7 @@ student_resource/
 *.zip
 # caches, intermediate artefacts, environments
 work/
+work_*/
 .venv/
 __pycache__/
 *.pyc

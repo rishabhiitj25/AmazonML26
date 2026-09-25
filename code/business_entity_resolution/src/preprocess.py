@@ -67,10 +67,14 @@ def main():
     ap.add_argument("--data-dir", required=True, help="folder containing train/ and test/")
     ap.add_argument("--cache", required=True)
     ap.add_argument("--workers", type=int, default=min(32, os.cpu_count()))
+    ap.add_argument("--splits", default="train,test")
+    ap.add_argument("--token-map", default=None,
+                    help="pre-learned token_map.json (required when train is not among --splits)")
     args = ap.parse_args()
+    splits = [x for x in args.splits.split(",") if x]
     cache = Path(args.cache)
     cache.mkdir(parents=True, exist_ok=True)
-    for split in ("train", "test"):
+    for split in splits:
         for s in (1, 2, 3):
             dst = cache / f"{split}_s{s}.parquet"
             if dst.exists():
@@ -81,13 +85,17 @@ def main():
             print(f"{dst.name}: {len(df):,} rows in {time.time() - t:.0f}s", flush=True)
 
     map_path = cache / "token_map.json"
+    if args.token_map and not map_path.exists():
+        token_map.save(token_map.load(args.token_map), map_path)
     if map_path.exists():
         tmap = token_map.load(map_path)
     else:
+        if "train" not in splits:
+            raise ValueError("no token map: pass --token-map or include the train split")
         tmap = build_token_map(Path(args.data_dir), cache)
         token_map.save(tmap, map_path)
     print(f"token map: {len(tmap):,} entries", flush=True)
-    for split in ("train", "test"):
+    for split in splits:
         for s in (1, 2, 3):
             apply_map_to_cache(cache / f"{split}_s{s}.parquet", tmap)
     print("token map applied", flush=True)

@@ -9,7 +9,8 @@ Layout follows the final submission package:
 ├── code/
 │   └── business_entity_resolution/
 │       ├── src/                    # all source code
-│       ├── README.md               # environment + end-to-end run instructions
+│       ├── artifacts/              # trained models + token map + decision rule (inference without retraining)
+│       ├── README.md               # setup, quick start (inference), full retraining, hardware
 │       └── requirements.txt        # pinned dependencies
 └── Documentation_template.md       # methodology write-up
 ```
@@ -20,5 +21,8 @@ record assignment + expected-F0.5 set selection.
 
 **Validation (out-of-fold, full training set):** macro F0.5 = **0.9768** (US 0.9775, India 0.9759);
 blocking pair recall 98.9%.
+
+**Teammates:** get the dataset from the challenge portal, then follow the *Quick start* in
+`code/business_entity_resolution/README.md` (one command, shipped models, no training).
 
 See `code/business_entity_resolution/README.md` to reproduce and `Documentation_template.md` for details.

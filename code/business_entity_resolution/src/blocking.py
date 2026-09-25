@@ -71,36 +71,58 @@ def _dense_on_gpu(M: sp.csr_matrix, device, rows=50_000):
     return torch.cat(parts)
 
 
+def _merge_topk(V1, I1, V2, I2, k):
+    V, I = np.concatenate([V1, V2], axis=1), np.concatenate([I1, I2], axis=1)
+    order = np.argsort(-V, axis=1, kind="stable")[:, :k]
+    return np.take_along_axis(V, order, 1), np.take_along_axis(I, order, 1)
+
+
+def n_gpu_shards(n_rows: int, vocab: int, devices, chunk: int, mem_fraction: float = 0.6) -> int:
+    """Smallest number of S1 shards (>= #devices) whose dense fp16 block + one score chunk fits in GPU memory."""
+    import torch
+    free = min(torch.cuda.mem_get_info(torch.device(d))[0] for d in devices)
+    rows_fit = int(mem_fraction * free / (2 * (vocab + chunk)))
+    if rows_fit < 1000:
+        raise RuntimeError(f"not enough free GPU memory ({free / 2**30:.1f} GiB) for GPU blocking; use CPU")
+    shards = max(len(devices), -(-n_rows // rows_fit))
+    return -(-shards // len(devices)) * len(devices)
+
+
 def topk_dense_multi_gpu(Q: sp.csr_matrix, X: sp.csr_matrix, k: int, devices, chunk: int = 4096):
-    """Top-k inner products with S1 rows sharded densely (fp16) across GPUs; queries streamed.
+    """Top-k inner products with S1 rows sharded densely (fp16) over the given GPUs; queries streamed.
+    The number of shards adapts to free GPU memory (several shards per GPU run sequentially).
     Used only to rank candidates; exact float32 cosines are recomputed afterwards."""
     import threading
 
     import torch
-    n = X.shape[0]
-    bounds = np.linspace(0, n, len(devices) + 1, dtype=int)
-    nq = Q.shape[0]
-    vals = [np.zeros((nq, k), np.float32) for _ in devices]
+    n, nq = X.shape[0], Q.shape[0]
+    n_shards = n_gpu_shards(n, X.shape[1], devices, chunk)
+    bounds = np.linspace(0, n, n_shards + 1, dtype=int)
+    vals = [np.full((nq, k), -1.0, np.float32) for _ in devices]
     idxs = [np.zeros((nq, k), np.int64) for _ in devices]
 
     def work(g, dev):
         with torch.no_grad(), torch.cuda.device(dev):
-            Xd = _dense_on_gpu(X[bounds[g]:bounds[g + 1]], dev)
-            kk = min(k, Xd.shape[0])
-            for a in range(0, nq, chunk):
-                Qh = _to_torch_csr(Q[a:a + chunk], dev).to_dense().half()
-                v, i = torch.topk(Qh @ Xd.T, kk, dim=1)
-                vals[g][a:a + len(v), :kk] = v.float().cpu().numpy()
-                idxs[g][a:a + len(v), :kk] = i.cpu().numpy() + bounds[g]
-            del Xd
-            torch.cuda.empty_cache()
+            for s in range(g, n_shards, len(devices)):
+                Xd = _dense_on_gpu(X[bounds[s]:bounds[s + 1]], dev)
+                kk = min(k, Xd.shape[0])
+                V = np.full((nq, k), -1.0, np.float32)
+                I = np.zeros((nq, k), np.int64)
+                for a in range(0, nq, chunk):
+                    Qh = _to_torch_csr(Q[a:a + chunk], dev).to_dense().half()
+                    v, i = torch.topk(Qh @ Xd.T, kk, dim=1)
+                    V[a:a + len(v), :kk] = v.float().cpu().numpy()
+                    I[a:a + len(v), :kk] = i.cpu().numpy() + bounds[s]
+                del Xd
+                torch.cuda.empty_cache()
+                vals[g], idxs[g] = _merge_topk(vals[g], idxs[g], V, I, k)
 
     th = [threading.Thread(target=work, args=(g, d)) for g, d in enumerate(devices)]
     [t.start() for t in th]
     [t.join() for t in th]
-    V, I = np.concatenate(vals, axis=1), np.concatenate(idxs, axis=1)
-    order = np.argsort(-V, axis=1, kind="stable")[:, :k]
-    V, I = np.take_along_axis(V, order, 1), np.take_along_axis(I, order, 1)
+    V, I = vals[0], idxs[0]
+    for g in range(1, len(devices)):
+        V, I = _merge_topk(V, I, vals[g], idxs[g], k)
     keep = V > 0
     rows = np.broadcast_to(np.arange(nq)[:, None], V.shape)
     return rows[keep].astype(np.int64), I[keep].astype(np.int64), V[keep]

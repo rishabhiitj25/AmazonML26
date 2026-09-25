@@ -4,6 +4,7 @@
 Each stage caches its output under --work and is skipped if the file already exists."""
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 import time
@@ -69,34 +70,61 @@ def write_outputs(cache: Path, cands_path: Path, pred_path: Path, decision: dict
     print(f"wrote outputs: {len(c):,} candidate pairs, {len(a):,} matches, {len(s1_ids):,} S1 rows")
 
 
+def export_artifacts(work: Path, dst: Path):
+    """Everything inference needs, learned from train: fold models, token map, decision rule."""
+    (dst / "models").mkdir(parents=True, exist_ok=True)
+    for f in sorted((work / "models").glob("xgb_fold*.json")):
+        shutil.copy2(f, dst / "models" / f.name)
+    shutil.copy2(work / "cache" / "token_map.json", dst / "token_map.json")
+    shutil.copy2(work / "decision.json", dst / "decision.json")
+    print(f"artifacts exported to {dst}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", required=True, help="student_resource/dataset")
     ap.add_argument("--work", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--mode", choices=["full", "inference"], default="full",
+                    help="full: train from scratch (then export artifacts); inference: test only, using --artifacts")
+    ap.add_argument("--artifacts", default=None,
+                    help="dir with models/xgb_fold*.json, token_map.json, decision.json "
+                         "(read in inference mode, written in full mode if given)")
     ap.add_argument("--threads", type=int, default=64)
-    ap.add_argument("--gpus", default="cuda:0,cuda:1")
+    ap.add_argument("--gpus", default="cuda:0,cuda:1", help="comma-separated CUDA devices; '' = CPU only")
     a = ap.parse_args()
     gpus = [d for d in a.gpus.split(",") if d]
     blocking.DEVICES[:] = gpus            # empty -> CPU sparse top-k
     model_devs = gpus or ["cpu"]
     data, work, out = Path(a.data_dir).resolve(), Path(a.work).resolve(), Path(a.out).resolve()
+    art = Path(a.artifacts).resolve() if a.artifacts else None
     cache = work / "cache"
     gt = data / "train" / "train_ground_truth.tsv"
+    inference = a.mode == "inference"
+    if inference and art is None:
+        ap.error("--mode inference needs --artifacts")
 
-    subprocess.run([sys.executable, "-m", "src.preprocess", "--data-dir", str(data), "--cache", str(cache)],
-                   check=True, cwd=Path(__file__).resolve().parents[1])
-    for split in ("train", "test"):
+    cmd = [sys.executable, "-m", "src.preprocess", "--data-dir", str(data), "--cache", str(cache)]
+    if inference:
+        cmd += ["--splits", "test", "--token-map", str(art / "token_map.json")]
+    subprocess.run(cmd, check=True, cwd=Path(__file__).resolve().parents[1])
+
+    for split in (("test",) if inference else ("train", "test")):
         cp = work / split / "cands.parquet"
         step(f"blocking {split}", cp, lambda: blocking.run(cache, split, cp, 10, a.threads))
         fp = work / split / "feats.parquet"
         step(f"features {split}", fp, lambda: features.build(cache, split, cp, fp,
                                                              gt if split == "train" else None, a.threads))
-    models = work / "models"
-    oof = work / "train" / "oof.parquet"
-    step("train + OOF", oof, lambda: model.oof(work / "train" / "feats.parquet", oof, models, 2, 0.25, 600, model_devs))
-    dec = work / "decision.json"
-    step("decision tuning", dec, lambda: tune_decision(oof, cache, gt, dec))
+    if inference:
+        models, dec = art / "models", art / "decision.json"
+    else:
+        models, dec = work / "models", work / "decision.json"
+        oof = work / "train" / "oof.parquet"
+        step("train + OOF", oof, lambda: model.oof(work / "train" / "feats.parquet", oof, models, 2, 0.25, 600,
+                                                   model_devs))
+        step("decision tuning", dec, lambda: tune_decision(oof, cache, gt, dec))
+        if art is not None:
+            export_artifacts(work, art)
     pred = work / "test" / "pred.parquet"
     step("test prediction", pred, lambda: model.predict(work / "test" / "feats.parquet", pred, models, model_devs))
     write_outputs(cache, work / "test" / "cands.parquet", pred, json.load(open(dec)), out)

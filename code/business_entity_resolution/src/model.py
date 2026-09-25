@@ -76,16 +76,22 @@ def oof(feats: Path, out: Path, model_dir: Path, n_folds: int, neg_rate: float, 
     pd.DataFrame({"ri": df.ri.values, "si": df.si.values, "y": df.y.values, "p": p}).to_parquet(out, index=False)
 
 
-def predict(feats: Path, out: Path, model_dir: Path, devices):
-    df = pd.read_parquet(feats)
-    cols = feature_cols(df)
-    ps = []
-    for i, f in enumerate(sorted(model_dir.glob("xgb_fold*.json"))):
+def predict(feats: Path, out: Path, model_dir: Path, devices, batch_rows: int = 10_000_000):
+    """Average of the fold models; the feature file is streamed in batches to bound memory."""
+    import pyarrow.parquet as pq
+    boosters = []
+    for f in sorted(model_dir.glob("xgb_fold*.json")):
         bst = xgb.Booster(model_file=str(f))
         bst.set_param({"device": devices[0]})  # one GPU per process: multi-GPU predict from CPU data crashes
-        ps.append(predict_booster(bst, df[cols]))
-    pd.DataFrame({"ri": df.ri.values, "si": df.si.values, "p": np.mean(ps, axis=0).astype(np.float32)}
-                 ).to_parquet(out, index=False)
+        boosters.append(bst)
+    pf = pq.ParquetFile(feats)
+    cols = [c for c in pf.schema_arrow.names if c not in NON_FEATURES]
+    parts = []
+    for batch in pf.iter_batches(batch_size=batch_rows):
+        df = batch.to_pandas()
+        p = np.mean([predict_booster(b, df[cols]) for b in boosters], axis=0).astype(np.float32)
+        parts.append(pd.DataFrame({"ri": df.ri.values, "si": df.si.values, "p": p}))
+    pd.concat(parts, ignore_index=True).to_parquet(out, index=False)
 
 
 def main():
