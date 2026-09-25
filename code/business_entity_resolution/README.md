@@ -67,9 +67,9 @@ file (or use a new `--work`) to recompute a stage. Runs are resumable after inte
 | | Inference (`--mode inference`) | Full training (`--mode full`) |
 |---|---|---|
 | GPU | 1 CUDA GPU; ≥ 16 GB recommended (S1 is sharded to fit free memory) | 1–2 GPUs |
-| RAM | ~64 GB recommended | ~128 GB (OOF stage loads 192M × 38 features) |
+| RAM | ≥ 48 GB (measured peaks: blocking 25 GB, features 36 GB, prediction 13 GB) | ~128 GB (OOF stage loads 192M × 38 features) |
 | Disk (`--work`) | ~20 GB | ~35 GB |
-| Time on 2× L40S, 64 threads | ~1.3 h (blocking ~47 min) | ~4 h |
+| Time on 2× L40S, 64 threads | 70 min measured (blocking 41 min, features 19 min, prediction 4 min) | ~4 h |
 
 - `--gpus ''` runs without a GPU (CPU sparse top-k blocking and CPU XGBoost) — correct but slow
   (blocking alone takes several hours).
