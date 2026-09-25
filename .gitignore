@@ -1,0 +1,12 @@
+# challenge data (not redistributable, large)
+student_resource/
+*.zip
+# caches, intermediate artefacts, environments
+work/
+.venv/
+__pycache__/
+*.pyc
+# over GitHub's 100 MB file limit (2.4 GB) — kept locally / goes in the final zip
+output/candidate_pairs.tsv
+# internal working notes
+PLAN.md
