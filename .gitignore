@@ -11,3 +11,4 @@ __pycache__/
 output/candidate_pairs.tsv
 # internal working notes
 PLAN.md
+output_v*/
