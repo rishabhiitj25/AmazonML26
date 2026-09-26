@@ -1,6 +1,11 @@
 {
- "rule": "hybrid",
- "p_min": 0.3,
- "gate": 0.75,
- "oof_f05": 0.9768302791969262
+ "rule": "threshold",
+ "t": 0.8,
+ "oof_f05": 0.9872102610814213,
+ "best_plain_oof_rule": {
+  "rule": "hybrid",
+  "p_min": 0.3,
+  "gate": 0.75,
+  "oof_f05": 0.9872881579971219
+ }
 }

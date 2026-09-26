@@ -12,3 +12,4 @@ output/candidate_pairs.tsv
 # internal working notes
 PLAN.md
 output_v*/
+.pytest_cache/

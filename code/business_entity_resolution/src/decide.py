@@ -22,24 +22,27 @@ def assign_threshold(best: pd.DataFrame, t: float) -> pd.DataFrame:
     return best[best.p.values >= t]
 
 
-def assign_hybrid(pr, best, n_s1, p_min: float, gate: float, mass_scale: float = 1.0):
+def assign_hybrid(pr, best, n_s1, p_min: float, gate: float, mass_scale: float = 1.0, n_hat=None):
     """Expected-F0.5 set size, but an S1 stays empty unless its best assigned record has p >= gate."""
-    a = assign_expected_f(pr, best, n_s1, p_min=p_min, mass_scale=mass_scale, use_empty=False)
+    a = assign_expected_f(pr, best, n_s1, p_min=p_min, mass_scale=mass_scale, use_empty=False, n_hat=n_hat)
     top = pd.Series(a.p.values).groupby(a.si.values).transform("max").values
     return a[top >= gate]
 
 
 def assign_expected_f(pr: pd.DataFrame, best: pd.DataFrame, n_s1: int, p_min: float = 0.02,
-                      mass_scale: float = 1.0, use_empty: bool = True) -> pd.DataFrame:
+                      mass_scale: float = 1.0, use_empty: bool = True, n_hat=None) -> pd.DataFrame:
     """Per S1 choose the top-m of its assigned records maximising expected F0.5, or the empty set.
 
     Expected true-match count N = mass_scale * sum of p over ALL candidate pairs of the S1;
     E[F | top-m] ~= 1.25 * sum_{i<=m} p_i / (m + 0.25 * max(N, sum_{i<=m} p_i));
-    E[F | empty] = P(no match) ~= prod(1 - p) over the S1's candidate pairs."""
-    si_all, p_all = pr.si.values, pr.p.values.astype(np.float64)
-    n_hat = mass_scale * np.bincount(si_all, weights=p_all, minlength=n_s1)
-    log_p0 = np.bincount(si_all, weights=np.log1p(-np.clip(p_all, 0, 1 - 1e-7)), minlength=n_s1)
-    p0 = np.exp(log_p0)
+    E[F | empty] = P(no match) ~= prod(1 - p) over the S1's candidate pairs.
+    n_hat: optional precomputed sum of p per S1 over all pairs (then only use_empty needs pr)."""
+    if n_hat is None or use_empty:
+        si_all, p_all = pr.si.values, pr.p.values.astype(np.float64)
+        n_hat = np.bincount(si_all, weights=p_all, minlength=n_s1)
+        log_p0 = np.bincount(si_all, weights=np.log1p(-np.clip(p_all, 0, 1 - 1e-7)), minlength=n_s1)
+        p0 = np.exp(log_p0)
+    n_hat = mass_scale * n_hat
 
     b = best[best.p.values >= p_min]
     order = np.lexsort((-b.p.values, b.si.values))

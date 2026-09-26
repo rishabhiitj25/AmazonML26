@@ -23,9 +23,21 @@ BLOCKERS = {
 }
 
 
-def make_vectorizer():
-    return TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 3), min_df=2, sublinear_tf=True,
+def make_vectorizer(min_df: int = 2):
+    return TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 3), min_df=min_df, sublinear_tf=True,
                            dtype=np.float32)
+
+
+def fit_vectorizer(texts):
+    """min_df=2 normally; tiny countries (e.g. a single S1) may have no 3-gram shared by two S1s, then min_df=1.
+    Returns (None, None) when no S1 text has any 3-gram at all."""
+    for min_df in (2, 1):
+        try:
+            vec = make_vectorizer(min_df)
+            return vec, vec.fit_transform(texts).tocsr()
+        except ValueError:
+            continue
+    return None, None
 
 
 def topk(Q: sp.csr_matrix, XT: sp.csr_matrix, k: int, threads: int, chunk: int = 500_000):
@@ -101,9 +113,19 @@ def topk_dense_multi_gpu(Q: sp.csr_matrix, X: sp.csr_matrix, k: int, devices, ch
     vals = [np.full((nq, k), -1.0, np.float32) for _ in devices]
     idxs = [np.zeros((nq, k), np.int64) for _ in devices]
 
+    errors = []
+
     def work(g, dev):
+        try:
+            _work(g, dev)
+        except BaseException as e:          # re-raised below: a failed shard must not silently drop candidates
+            errors.append(e)
+
+    def _work(g, dev):
         with torch.no_grad(), torch.cuda.device(dev):
             for s in range(g, n_shards, len(devices)):
+                if bounds[s + 1] == bounds[s]:
+                    continue
                 Xd = _dense_on_gpu(X[bounds[s]:bounds[s + 1]], dev)
                 kk = min(k, Xd.shape[0])
                 V = np.full((nq, k), -1.0, np.float32)
@@ -120,6 +142,8 @@ def topk_dense_multi_gpu(Q: sp.csr_matrix, X: sp.csr_matrix, k: int, devices, ch
     th = [threading.Thread(target=work, args=(g, d)) for g, d in enumerate(devices)]
     [t.start() for t in th]
     [t.join() for t in th]
+    if errors:
+        raise errors[0]
     V, I = vals[0], idxs[0]
     for g in range(1, len(devices)):
         V, I = _merge_topk(V, I, vals[g], idxs[g], k)
@@ -140,8 +164,14 @@ def block_country(s1: pd.DataFrame, recs: pd.DataFrame, k: int, threads: int) ->
     mats, found = {}, []
     for bname, text in BLOCKERS.items():
         t = time.time()
-        vec = make_vectorizer()
-        X = vec.fit_transform(text(s1)).tocsr()
+        vec, X = fit_vectorizer(text(s1))
+        if vec is None or len(recs) == 0:
+            X = sp.csr_matrix((len(s1), 1), dtype=np.float32)
+            Q = sp.csr_matrix((len(recs), 1), dtype=np.float32)
+            mats[bname] = (Q, X)
+            found.append(pd.DataFrame({"qi": np.zeros(0, np.int64), "si": np.zeros(0, np.int64),
+                                       f"rank_{bname}": np.zeros(0, np.int16)}))
+            continue
         Q = vec.transform(text(recs)).tocsr()
         mats[bname] = (Q, X)
         t1 = time.time()

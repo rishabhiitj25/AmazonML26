@@ -1,5 +1,6 @@
 """End-to-end: data -> preprocess -> blocking -> features -> XGBoost-GPU (OOF on train) -> decision tuning
 -> test predictions -> output/matching_results.tsv + output/candidate_pairs.tsv.
+Feature stages: features.py (string/context features) and xfeatures.py (token-level features), row-aligned.
 
 Each stage caches its output under --work and is skipped if the file already exists."""
 import argparse
@@ -13,9 +14,17 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import blocking, features, model
+from . import blocking, features, model, xfeatures
 from .decide import assign_hybrid, assign_threshold, best_per_record, score_rows
 from .io_utils import CAND_HEADER, MATCH_HEADER, write_id_lists
+
+
+# Selected by the validation protocol in Documentation_template.md (plain OOF + distractor-density
+# simulation + leave-one-country-out); see README "Model selection".
+MODEL = {"n_folds": 5, "neg_rate": 0.5, "rounds": 3000, "params": {"learning_rate": 0.05}, "es_frac": 0.05}
+# A plain threshold is used instead of the rule that maximises plain OOF: under test-like distractor density
+# and on an unseen country it is best or within 1e-4 of best, while mass-based set-size rules over-assign.
+DECISION = {"rule": "threshold", "t": 0.8}
 
 
 def step(name, path: Path, fn):
@@ -27,29 +36,37 @@ def step(name, path: Path, fn):
     print(f"[done] {name} in {time.time() - t:.0f}s", flush=True)
 
 
-def apply_decision(pr: pd.DataFrame, decision: dict, n_s1: int) -> pd.DataFrame:
+def apply_decision(pr: pd.DataFrame, decision: dict, n_s1: int, n_hat=None) -> pd.DataFrame:
+    """n_hat (optional): per-S1 sum of p over ALL pairs, when pr holds only rows with p >= the rule's minimum."""
     best = best_per_record(pr)
     if decision["rule"] == "threshold":
         return assign_threshold(best, decision["t"])
-    return assign_hybrid(pr, best, n_s1, decision["p_min"], decision["gate"])
+    return assign_hybrid(pr, best, n_s1, decision["p_min"], decision["gate"], n_hat=n_hat)
 
 
 def tune_decision(oof_path: Path, cache: Path, gt_path: Path, out: Path):
-    """Grid over decision rules on OOF train predictions; keep the best macro F0.5."""
+    """Report the decision-rule grid on OOF train predictions and record the chosen rule (DECISION)."""
     s1, recs = features.load_tables(cache, "train")
     true_si = features.labels(recs, s1, gt_path)
     pr = pd.read_parquet(oof_path, columns=["ri", "si", "p"])
     grid = [{"rule": "threshold", "t": float(t)} for t in np.round(np.arange(0.3, 0.96, 0.05), 2)]
     grid += [{"rule": "hybrid", "p_min": pm, "gate": float(g)}
              for pm in (0.3, 0.5) for g in np.round(np.arange(0.6, 0.96, 0.05), 2)]
+    # exact speed-up: every rule only assigns rows with p >= 0.3; the hybrid's p-mass uses all rows
+    n_hat = np.bincount(pr.si.values, weights=pr.p.values.astype(np.float64), minlength=len(s1))
+    pr = pr[pr.p.values >= 0.3].reset_index(drop=True)
     res = []
     for d in grid:
-        a = apply_decision(pr, d, len(s1))
+        a = apply_decision(pr, d, len(s1), n_hat)
         res.append({**d, "oof_f05": float(score_rows(a.ri.values, a.si.values, true_si, len(s1)).mean())})
         print(res[-1], flush=True)
     best = max(res, key=lambda r: r["oof_f05"])
-    print("chosen:", best)
-    json.dump(best, open(out, "w"), indent=1)
+    a = apply_decision(pr, DECISION, len(s1))
+    chosen = {**DECISION, "oof_f05": float(score_rows(a.ri.values, a.si.values, true_si, len(s1)).mean()),
+              "best_plain_oof_rule": best}
+    print("plain-OOF best:", best)
+    print("chosen (selected on density simulation + leave-one-country-out):", chosen)
+    json.dump(chosen, open(out, "w"), indent=1)
 
 
 def write_outputs(cache: Path, cands_path: Path, pred_path: Path, decision: dict, out_dir: Path):
@@ -73,8 +90,9 @@ def write_outputs(cache: Path, cands_path: Path, pred_path: Path, decision: dict
 def export_artifacts(work: Path, dst: Path):
     """Everything inference needs, learned from train: fold models, token map, decision rule."""
     (dst / "models").mkdir(parents=True, exist_ok=True)
-    for f in sorted((work / "models").glob("xgb_fold*.json")):
-        shutil.copy2(f, dst / "models" / f.name)
+    for f in sorted((work / "models").glob("*")):
+        if f.name.startswith("xgb_fold") or f.name == "model_config.json":
+            shutil.copy2(f, dst / "models" / f.name)
     shutil.copy2(work / "cache" / "token_map.json", dst / "token_map.json")
     shutil.copy2(work / "decision.json", dst / "decision.json")
     print(f"artifacts exported to {dst}")
@@ -88,7 +106,7 @@ def main():
     ap.add_argument("--mode", choices=["full", "inference"], default="full",
                     help="full: train from scratch (then export artifacts); inference: test only, using --artifacts")
     ap.add_argument("--artifacts", default=None,
-                    help="dir with models/xgb_fold*.json, token_map.json, decision.json "
+                    help="dir with models/xgb_fold*.ubj, token_map.json, decision.json "
                          "(read in inference mode, written in full mode if given)")
     ap.add_argument("--threads", type=int, default=64)
     ap.add_argument("--gpus", default="cuda:0,cuda:1", help="comma-separated CUDA devices; '' = CPU only")
@@ -101,6 +119,7 @@ def main():
     cache = work / "cache"
     gt = data / "train" / "train_ground_truth.tsv"
     inference = a.mode == "inference"
+    feat_paths = lambda split: [work / split / "feats.parquet", work / split / "xfeats.parquet"]
     if inference and art is None:
         ap.error("--mode inference needs --artifacts")
 
@@ -115,18 +134,21 @@ def main():
         fp = work / split / "feats.parquet"
         step(f"features {split}", fp, lambda: features.build(cache, split, cp, fp,
                                                              gt if split == "train" else None, a.threads))
+        xp = work / split / "xfeats.parquet"
+        step(f"token features {split}", xp, lambda: xfeatures.build(cache, split, cp, xp, a.threads))
     if inference:
         models, dec = art / "models", art / "decision.json"
     else:
         models, dec = work / "models", work / "decision.json"
         oof = work / "train" / "oof.parquet"
-        step("train + OOF", oof, lambda: model.oof(work / "train" / "feats.parquet", oof, models, 2, 0.25, 600,
-                                                   model_devs))
+        step("train + OOF", oof, lambda: model.oof(feat_paths("train"), oof, models, MODEL["n_folds"],
+                                                   MODEL["neg_rate"], MODEL["rounds"], model_devs, MODEL["params"],
+                                                   MODEL["es_frac"]))
         step("decision tuning", dec, lambda: tune_decision(oof, cache, gt, dec))
         if art is not None:
             export_artifacts(work, art)
     pred = work / "test" / "pred.parquet"
-    step("test prediction", pred, lambda: model.predict(work / "test" / "feats.parquet", pred, models, model_devs))
+    step("test prediction", pred, lambda: model.predict(feat_paths("test"), pred, models, model_devs))
     write_outputs(cache, work / "test" / "cands.parquet", pred, json.load(open(dec)), out)
 
 

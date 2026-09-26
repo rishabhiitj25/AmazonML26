@@ -1,0 +1,18 @@
+{
+ "n_folds": 5,
+ "neg_rate": 0.5,
+ "rounds": 3000,
+ "es_frac": 0.05,
+ "params": {
+  "objective": "binary:logistic",
+  "eval_metric": "logloss",
+  "tree_method": "hist",
+  "max_depth": 10,
+  "learning_rate": 0.05,
+  "subsample": 0.8,
+  "colsample_bytree": 0.8,
+  "min_child_weight": 5,
+  "reg_lambda": 1.0,
+  "max_bin": 256
+ }
+}

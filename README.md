@@ -10,17 +10,23 @@ Layout follows the final submission package:
 │   └── business_entity_resolution/
 │       ├── src/                    # all source code
 │       ├── artifacts/              # trained models + token map + decision rule (inference without retraining)
+│       ├── tests/                  # pytest suite (unit + end-to-end with extreme cases)
 │       ├── README.md               # setup, quick start (inference), full retraining, hardware
 │       └── requirements.txt        # pinned dependencies
 └── Documentation_template.md       # methodology write-up
 ```
 
 **Approach:** learned cross-script token map → exact char-3gram TF-IDF blocking on GPU (record → top-10 S1,
-same country label) → 38 pair/context features → XGBoost (GPU, 2-fold OOF grouped by S1) → one-to-one
-record assignment + expected-F0.5 set selection.
+same country label) → 38 string/context features + 37 token-level near-miss features → XGBoost (GPU, 5-fold
+OOF grouped by S1, early stopping) → one-to-one record assignment with a probability threshold (0.80).
 
-**Validation (out-of-fold, full training set):** macro F0.5 = **0.9768** (US 0.9775, India 0.9759);
-blocking pair recall 98.9%.
+**Validation (training data, macro F0.5):** out-of-fold **0.9872**; under test-like distractor density
+**0.9863**; unseen country (leave-one-country-out) **0.9521**. Blocking pair recall 98.9%.
+The configuration was chosen on the density simulation and the unseen-country split, not on plain
+out-of-fold scores. That simulation reproduced both earlier leaderboard results (v1 0.969, stacked v2 0.965).
+
+**Submissions:** `output/matching_results.tsv` = v1 (LB 0.969); `submissions/v3/matching_results.tsv` = current
+pipeline (token features, K=5); `submissions/v2_stage2/` = stacked model (LB 0.965, superseded).
 
 **Teammates:** get the dataset from the challenge portal, then follow the *Quick start* in
 `code/business_entity_resolution/README.md` (one command, shipped models, no training).

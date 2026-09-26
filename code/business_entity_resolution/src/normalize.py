@@ -9,11 +9,17 @@ _DIGITS = re.compile(r"\d+")
 _MISSING_COMPONENTS = {"null", "none", "n/a", "na", "nil", "-"}
 
 
+def _symbol_to_space(c: str) -> str:
+    """Non-ASCII punctuation/symbols are separators, not text: anyascii would spell some of them out
+    ("N°12" -> "ndeg12", "¢" -> "c"). Letters, marks (accents) and digits are kept for romanisation."""
+    return " " if ord(c) > 127 and unicodedata.category(c)[0] in "PS" else c
+
+
 def to_latin(s: str) -> str:
-    """NFKC, then romanise any non-ASCII text (also folds accents), lowercase."""
+    """NFKC, non-ASCII punctuation/symbols -> space, then romanise non-ASCII text (folds accents), lowercase."""
     s = unicodedata.normalize("NFKC", s)
     if not s.isascii():
-        s = anyascii(s)
+        s = anyascii("".join(map(_symbol_to_space, s)))
     return s.lower()
 
 
